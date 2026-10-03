@@ -1,4 +1,6 @@
-*-profile
+﻿*-profile
 node_modules
 .env
 *.mp3
+auth.json
+meetings/

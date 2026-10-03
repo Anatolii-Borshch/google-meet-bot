@@ -194,6 +194,36 @@ function pageCapture() {
     };
   };
 
+  // Active speaker + present names from participant tiles (selectors as used by Vexa; Meet's
+  // speaking classes are obfuscated and may change). The bot's own tile is excluded.
+  const SPEAKING_CLASSES = ['Oaajhc', 'HX2H7', 'wEsLMd', 'OgVli'];
+  const JUNK_NAME = /^Google Participant \(|spaces\/|devices\//;
+  function readTiles() {
+    const tiles = new Map(); // participant id -> { name, speaking, self }
+    document.querySelectorAll('[data-participant-id]').forEach((el) => {
+      const id = el.getAttribute('data-participant-id');
+      const name = (el.querySelector('span.notranslate')?.textContent || '').trim();
+      const t = tiles.get(id) || { name: '', speaking: false, self: false };
+      if (!t.name && name.length >= 2 && name.length <= 50 && !JUNK_NAME.test(name)) t.name = name;
+      t.self ||= el.hasAttribute('data-self-name') || !!el.querySelector('[data-self-name]');
+      t.speaking ||= SPEAKING_CLASSES.some((c) => el.classList.contains(c) || el.querySelector('.' + c));
+      tiles.set(id, t);
+    });
+    const others = [...tiles.values()].filter((t) => t.name && !t.self);
+    return {
+      speaking: others.filter((t) => t.speaking).map((t) => t.name).sort(),
+      present: [...new Set(others.map((t) => t.name))].sort(),
+    };
+  }
+  let lastTiles = '';
+  function pollSpeakers() {
+    const tiles = readTiles();
+    const key = JSON.stringify(tiles);
+    if (key === lastTiles) return;
+    lastTiles = key;
+    window.__meetRecorderSpeakers(tiles.speaking, tiles.present);
+  }
+
   window.__meetRecorderStart = async () => {
     if (ctx) return;
     ctx = new OrigAC({ sampleRate: 48000 });
@@ -219,6 +249,7 @@ function pageCapture() {
     await ctx.resume();
     taps.forEach((s) => attach(s, 'page AudioContext'));
     scanElements();
+    setInterval(pollSpeakers, 250);
     setInterval(() => {
       scanElements();
       sampleNetwork();
@@ -247,7 +278,13 @@ class MeetBot extends EventEmitter {
     if (!this.opts.url) throw new Error('url is required');
     this.audio = this.opts.stream ? new PassThrough() : null;
     this.participants = 0;
+    this.samples = 0;
     this.stopping = null;
+  }
+
+  // Seconds of captured audio so far: the shared clock for speakers and transcripts
+  audioTime() {
+    return this.samples / CAPTURE_RATE;
   }
 
   async start() {
@@ -261,7 +298,14 @@ class MeetBot extends EventEmitter {
       }
       const page = (this.page = this.context.pages()[0] || (await this.context.newPage()));
       await page.exposeFunction('__meetRecorderPush', (b64) => {
-        if (this.ffmpeg && !this.stopping) this.ffmpeg.stdin.write(Buffer.from(b64, 'base64'));
+        if (this.stopping) return;
+        const pcm = Buffer.from(b64, 'base64');
+        this.samples += pcm.length / 2;
+        this.ffmpeg?.stdin.write(pcm);
+        this.emit('pcm', pcm); // raw 48 kHz mono s16le, e.g. for transcription
+      });
+      await page.exposeFunction('__meetRecorderSpeakers', (speaking, present) => {
+        this.emit('speakers', { speaking, present, at: this.audioTime() });
       });
       await page.exposeFunction('__meetRecorderLog', (msg) => o.log(msg));
       await page.addInitScript(pageCapture);
